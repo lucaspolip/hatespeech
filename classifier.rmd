@@ -1,0 +1,286 @@
+---
+title: "Classification Competition Code"
+date: "null"
+output:
+  html_document:
+    df_print: paged
+---
+
+
+
+```{r message=FALSE, warning=FALSE, cache=TRUE}
+
+# Setup
+
+#install.packages("textrecipes")
+#install.packages("recipes")
+#install.packages("rsample")
+#install.packages("themis")
+#library(textrecipes)
+#library(recipes)
+#library(rsample)
+#library(themis)
+
+library(glmnet)
+library(quanteda)
+library(tidytext)
+library(stringr)
+library(caret)
+library(tidyverse)
+library(textdata)
+
+#Organizing the data 
+
+download.file('https://github.com/lse-my474/pset_data/raw/main/coms_tr.csv', 'coms_tr.csv')
+download.file('https://github.com/lse-my474/pset_data/raw/main/coms_te.csv', 'coms_te.csv')
+
+coms_te <- read.csv('coms_te.csv', stringsAsFactors = F)
+coms_tr <- read.csv('coms_tr.csv', stringsAsFactors = F)
+
+coms_te$sample <- rep('test', nrow(coms_te))
+coms_tr$sample <- rep('train', nrow(coms_tr))
+coms_te$toxic <- NA
+
+ncol(coms_tr)
+ncol(coms_te)
+
+data <- rbind(coms_tr, coms_te)
+
+train_data <- data[data$sample == 'train',]
+test_data <- data[data$sample == 'test',]
+
+train_data$toxic <- factor(train_data$toxic)
+
+# Dfm creation, tokenization and pre-processing
+
+corpus <- corpus(data, text_field="comment")
+
+toks <- tokens(corpus)
+toks_1_2 <- tokens_ngrams(toks, 1:2)
+
+toxdfm <- dfm(toks)
+toxdfm <- dfm_remove(toxdfm, stopwords("english"))
+
+toxdfm <- dfm_trim(toxdfm, min_docfreq = 5, min_termfreq = 20, verbose=TRUE)
+
+?dfm_trim
+
+train_dfm <- toxdfm[data$sample == 'train',]
+test_dfm <- toxdfm[data$sample == 'test',]
+
+
+sentiment_lexicon <- get_sentiments("afinn") %>% 
+  rename(term = word, score = value) %>% 
+  select(term, score)
+
+#Here i'm scoring the sentiment analysis in the training data
+
+sentiment_scores <- train_data %>% 
+  mutate(comment = as.character(comment)) %>%
+  unnest_tokens(term, comment) %>% 
+  inner_join(sentiment_lexicon, by = "term") %>% 
+  group_by(rev_id) %>% 
+  summarize(sentiment_scores = sum(score)) %>% 
+  ungroup()
+
+#Here im joining the data
+
+train_data <- left_join(train_data, sentiment_scores, by = "rev_id")
+
+#transforming the NA =0 
+train_data <- train_data %>% 
+  replace_na(list(sentiment_scores = 0))
+
+#Selecting the most common words in toxic comments 
+
+toxic_dfm <- dfm(train_data$comment[train_data$toxic == 1], remove_punct = TRUE, remove_numbers = TRUE, remove = c("wikipedia", "page", "can", "u", "`", "=", "get", "know", "article", "one", "people", "like", "hi", "just",  "go", "now", "want", "time", "even", "think", "talk", "wiki", "|", "life", stopwords("english")), ngrams = 1:2)
+
+top_toxic_words <- topfeatures(toxic_dfm, n = 20)
+toxic_word_counts <- colSums(toxic_dfm)
+top_toxic_words <- names(sort(toxic_word_counts, decreasing = TRUE))[1:20]
+print(top_toxic_words)
+train_data$toxic_word_count <- rowSums(sapply(top_toxic_words, function(word) {
+  grepl(paste0("\\b", word, "\\b"), train_data$comment, ignore.case = TRUE)
+}))
+
+#normalizing my features by the length
+
+modify_train_data <- function(train_data) {
+  train_data$comment_length <- nchar(train_data$comment)
+  train_data$toxic_word_count <- train_data$toxic_word_count / train_data$comment_length
+  train_data$capital_word_count <- str_count(train_data$comment, "\\b[A-Z]+\\b")
+  train_data$capital_word_count <- train_data$capital_word_count / train_data$comment_length
+  train_data$sentiment_scores <- train_data$sentiment_scores / train_data$comment_length
+  train_data <- subset(train_data, select = -comment_length)
+  return(train_data)
+}
+
+train_data <- modify_train_data(train_data)
+
+#Now i will do the same for the test_data 
+
+sentiment_scores <- test_data %>% 
+  mutate(comment = as.character(comment)) %>%
+  unnest_tokens(term, comment) %>% 
+  inner_join(sentiment_lexicon, by = "term") %>% 
+  group_by(rev_id) %>% 
+  summarize(sentiment_scores = sum(score)) %>% 
+  ungroup()
+
+test_data <- left_join(test_data, sentiment_scores, by = "rev_id")
+test_data <- test_data %>% 
+  replace_na(list(sentiment_scores = 0))
+
+test_data$toxic_word_count <- rowSums(sapply(top_toxic_words, function(word) {
+  grepl(paste0("\\b", word, "\\b"), test_data$comment, ignore.case = TRUE)
+}))
+
+
+#normalizing the features 
+modify_test_data <- function(test_data) {
+  test_data$comment_length <- nchar(test_data$comment)
+  test_data$capital_word_count <- str_count(test_data$comment, "\\b[A-Z]+\\b")
+  test_data$capital_word_count <- test_data$capital_word_count / test_data$comment_length
+  test_data$sentiment_scores <- test_data$sentiment_scores / test_data$comment_length
+  test_data$toxic_word_count <- test_data$toxic_word_count / test_data$comment_length
+  test_data <- subset(test_data, select = -comment_length)
+  return(test_data)
+}
+
+test_data <- modify_test_data(test_data)
+
+#transforming into a matrix
+convert_to_dfm_list <- function(train_dfm, matrix_list) {
+  dfm_list <- list(train_dfm)
+  for (i in seq_along(matrix_list)) {
+    matrix <- cbind(train_dfm, matrix_list[[i]])
+    dfm_list[[i+1]] <- as.dfm(matrix)
+  }
+  return(dfm_list)
+}
+
+# create a list of vectors to be combined into matrices
+matrix_list <- list(
+  c(train_data$toxic_word_count, train_data$capital_word_count, train_data$sentiment_score),
+  c(train_data$toxic_word_count, train_data$capital_word_count),
+  train_data$toxic_word_count,
+  train_data$capital_word_count,
+  c(train_data$capital_word_count, train_data$sentiment_score),
+  train_data$sentiment_score,
+  c(train_data$toxic_word_count, train_data$sentiment_score)
+)
+
+
+
+
+# convert the matrices to dfm objects using the function
+dfm_list <- convert_to_dfm_list(train_dfm, matrix_list)
+
+
+# Running Lasso Regression and predicting on the test data
+set.seed(123)
+N <- nrow(train_dfm)
+tr <- sample(1:N, floor(.20 * N))
+
+
+run_cv_glmnet <- function(dfm_list, target_var, family, nfolds, type_measure, alpha) {
+  cv_list <- list()
+  for (i in seq_along(dfm_list)) {
+    cv_list[[i]] <- cv.glmnet(dfm_list[[i]][tr,], target_var[tr], family = family, nfolds = nfolds, type.measure = type_measure, alpha = alpha)
+  }
+  return(cv_list)
+}
+
+cv_list <- run_cv_glmnet(dfm_list, train_data$toxic, family = "binomial", nfolds = 5, type_measure = "class", alpha = 1)
+
+error <- sapply(cv_list, function(x) min(x$cvm))
+best_cv <- which.min(error)
+#Checking which model is the best 
+
+cat("Model", best_cv, "had the smallest misclassification error of", round(error[best_cv], 4), "\n")
+# Save the graph as an image
+png("graph.png", width = 300, height = 300)
+plot_cv <- function(cv_list) {
+  error <- sapply(cv_list, function(x) min(x$cvm))
+  best_cv <- which.min(error)
+  plot(error, type = "b", xlab = "Model", ylab = "Misclassification error")
+  abline(h = min(error), col = "red", lty = 2)
+  return(cv_list[[best_cv]])
+}
+best_cv <- plot_cv(cv_list)
+dev.off()
+
+# Save the data frame as an image
+library(gridExtra)
+library(grid)
+
+# Save the data frame as two separate images: top10 and bottom10
+library(gridExtra)
+library(grid)
+
+coef_check <- function(best_cv) {
+  coef_mat <- predict(best_cv, type = "coef", s = "lambda.min")
+  var_names <- rownames(coef_mat)[-1]  # remove intercept
+  coef_vec <- as.numeric(as.array(coef_mat)[-1, 1])
+  coef_df <- data.frame(var_names, coef_vec, stringsAsFactors = FALSE)
+  coef_sorted_desc <- coef_df[order(coef_df$coef_vec, decreasing = TRUE),]
+  top10 <- coef_sorted_desc[1:10, ]
+  coef_sorted_asc <- coef_df[order(coef_df$coef_vec),]
+  bottom10 <- coef_sorted_asc[1:10, ]
+  return(list(top10 = top10, bottom10 = bottom10))
+}
+
+coef_result <- coef_check(best_cv)
+top10 <- coef_result$top10
+bottom10 <- coef_result$bottom10
+
+png("top10.png", width = 200, height = 200)
+grid.newpage()
+grid.table(top10, theme = ttheme_default(base_size = 7))
+dev.off()
+
+png("bottom10.png", width = 200, height = 200)
+grid.newpage()
+grid.table(bottom10, theme = ttheme_default(base_size = 7))
+dev.off()
+
+
+
+## Now running with the best model and 10 folds + all the data in the training set 
+
+test_matrix <- cbind(test_dfm, test_data$toxic_word_count, test_data$sentiment_scores, test_data$capital_word_count)
+
+test_dfm <- as.dfm(test_matrix)
+
+train_matrix_final <- cbind(train_dfm, test_data$toxic_word_count, test_data$sentiment_scores, test_data$capital_word_count)
+
+train_dfm_final <- as.dfm(train_matrix_final)
+
+dfmat_matched <- dfm_match(test_dfm, features = featnames(train_dfm_final))
+
+N <- nrow(train_dfm_final)
+tr <- sample(1:N)
+
+#cv_final <- cv.glmnet(train_dfm_final[tr,], train_data$toxic[tr], family = "binomial", nfolds = 10, type.measure = "class", alpha=1)
+
+#y_pred <- as.character(predict(cv_final, dfmat_matched, s = "lambda.min", type = "class"))
+
+#test_data$toxic <- y_pred
+
+test_data$sample <- NULL
+test_data$comment <- NULL
+test_data$capital_word_count <- NULL
+test_data$toxic_word_count <- NULL
+test_data$sentiment_scores <- NULL
+
+write.csv(test_data, file = "test_data.csv", row.names = FALSE)
+
+
+
+```
+
+
+
+
+```
+
